@@ -1,0 +1,60 @@
+# The Akeso service's runs in this repository's GitHub Actions. The service starts this workflow through its
+# GitHub App with a run id, which is no secret; the job exchanges its OIDC token for the run's token, downloads the
+# runner bundle from the service and runs it. Keep it as .github/workflows/akeso.yml on the branch runs start from.
+name: akeso
+run-name: akeso run ${{ inputs.run_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: The Akeso service's run id
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    env:
+      AKESO_URL: https://akeso.softup.co
+      AKESO_RUN_ID: ${{ inputs.run_id }}
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Exchange the job's OIDC token for the run's token
+        run: |
+          set -euo pipefail
+          [[ "$AKESO_RUN_ID" =~ ^[1-9][0-9]{0,17}$ ]] || { echo "Not a run id"; exit 1; }
+          oidc="$(curl -fsS --max-time 30 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AKESO_URL" | jq -r .value)"
+          echo "::add-mask::$oidc"
+          umask 077
+          curl -fsS --max-time 30 -X POST -H "Authorization: Bearer $oidc" -H 'content-type: application/json' \
+            --data "{\"runId\":\"$AKESO_RUN_ID\"}" "$AKESO_URL/v1/runner/actions/token" -o "$RUNNER_TEMP/akeso-run.json"
+          echo "::add-mask::$(jq -r .token "$RUNNER_TEMP/akeso-run.json")"
+      - name: Download and install the runner bundle
+        run: |
+          set -euo pipefail
+          token="$(jq -r .token "$RUNNER_TEMP/akeso-run.json")"
+          curl -fsS --max-time 300 -H "Authorization: Bearer $token" "$AKESO_URL/v1/runner/runs/$AKESO_RUN_ID/bundle" \
+            -o "$RUNNER_TEMP/akeso-kit.tgz"
+          mkdir -p "$RUNNER_TEMP/akeso-kit"
+          tar -xzf "$RUNNER_TEMP/akeso-kit.tgz" -C "$RUNNER_TEMP/akeso-kit"
+          (cd "$RUNNER_TEMP/akeso-kit" && PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci --workspace packages/ci --omit=dev --ignore-scripts --no-audit --no-fund)
+          # ffmpeg reads the frames of a video attached to a request. Non-interactive and bounded, so the install can never
+          # hold the run up; without it a run goes on, and only such a video is skipped.
+          if ! command -v ffmpeg > /dev/null; then
+            export DEBIAN_FRONTEND=noninteractive
+            { timeout 300 sudo -E apt-get -o DPkg::Lock::Timeout=60 update -qq \
+              && timeout 300 sudo -E apt-get -o DPkg::Lock::Timeout=60 install -y -qq --no-install-recommends ffmpeg; } \
+              || echo "::warning::ffmpeg could not be installed in time; a video attached to a request is skipped"
+          fi
+      - name: Run
+        run: sudo "$(command -v node)" "$RUNNER_TEMP/akeso-kit/packages/ci/bin/akeso-runner.mjs" --actions "$RUNNER_TEMP/akeso-run.json"
